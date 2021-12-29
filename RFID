@@ -1,0 +1,316 @@
+#include <SPI.h>                // Librería para la comunicación SPI
+#include <Ethernet.h>           // Librería para el Shield Ethernet
+#include <SD.h>
+#include <LiquidCrystal_I2C.h>  // Librería para controlar el LCD
+#include <MFRC522.h>            // Librería para el RFID(RC522)
+#include <DS3231.h>
+DS3231  rtc(SDA, SCL);
+
+void save_to_SD(String &id);
+void make_request(String clave, String &id);                              // declarar la función make_request
+String read_block(byte &block, MFRC522::MIFARE_Key &key);   // declarar la funcion read_block
+void emit_led(bool &state);                                 // declarar la funcion emit_led
+String getValue(String data, char separator, uint8_t index);
+
+//void clear_to_SD();
+
+//Configuración Ethernet
+byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED}; // Dirección MAC
+byte ip[] = {192, 168, 70, 113};                       // Dirección IP estática (Shield Ethernet)
+byte server[] = {192, 168, 20, 6};                   // Dirección IP Servidor (API)
+EthernetClient client;                                 // Declarar cliente Ethernet                               
+
+// Configuración RFID
+#define SS_PIN 9                      // Definir SS_PIN
+#define RST_PIN 8                     // Definir RST_PIN
+MFRC522 rfid(SS_PIN, RST_PIN);        // Crear objecto RFID           
+
+//Configuración LCD]¨]¡
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+unsigned long milisegundo = 0;
+
+File myFile;
+String codigos = "";
+boolean conectado = true;
+
+//DEFINIR PINES LED Y BUZZER
+#define BUZZER 7
+#define RED_LED 6
+#define GREEN_LED 5
+#define BLUE_LED 3
+
+#define low_leds() {digitalWrite(RED_LED, LOW);digitalWrite(GREEN_LED, LOW);digitalWrite(BLUE_LED, LOW);digitalWrite(BUZZER, LOW);}
+
+#define welcome_mssg() {lcd.setCursor(0, 0);lcd.print("     BIENVENIDO     ");lcd.setCursor(0, 1);lcd.print("  ASISTENCIA  RFID  ");lcd.setCursor(0, 2);lcd.print("    COLEGIO CIMA    ");}
+
+void setup(){
+  Serial.begin(9600);                   // Inicializando comunicación serial en 9600 baudios
+  SPI.begin();                          // Inicializando comunicación SPI
+  rfid.PCD_Init();                      // Inicializando RFID
+  lcd.init();                           // Inicializando LCD (16x2)
+  lcd.backlight();                        
+  lcd.clear();
+   rtc.begin();
+  //Mensaje Bienvenida CIMA
+
+  //Desabilitar RFID
+  pinMode(9, OUTPUT);
+  digitalWrite(9, HIGH);
+     
+  //Desabilitar la tarjeta SD
+  pinMode(4, OUTPUT);
+  digitalWrite(4, HIGH);
+      
+  //Habilitar el Shield Ethernet
+  pinMode(10, OUTPUT);
+  digitalWrite(10, HIGH); 
+     
+  //Definir pin para el BUZZER
+  pinMode(RED_LED, OUTPUT);  
+  pinMode(GREEN_LED, OUTPUT);  
+  pinMode(BUZZER, OUTPUT);
+  pinMode(BLUE_LED, OUTPUT);
+  low_leds();
+
+  //Inicializar Ethernet con la MAC e IP definidas
+  Ethernet.begin(mac, ip);
+
+  //if (!SD.begin(4)){ // Inicializamos el lector SD
+     //Serial.println("Fallo inicializacion de tarjeta SD!!!");
+  //}else{
+     //Serial.println("Tarjeta SD inicializada OK!");
+  //   //clear_to_SD();
+  //}
+  
+  if(!SD.begin(4)) Serial.println("Fallo al inicializar SD");
+  else clear_to_SD();
+  welcome_mssg();
+  //reloj();
+}
+
+void loop(){      
+
+  milisegundo++;
+  if(milisegundo==10) welcome_mssg();
+  reloj();
+
+  if ((codigos != "" && conectado) || (codigos != "" && milisegundo >= 500)) make_request("codigos", codigos);
+  //Preparamos la clave(key)
+  MFRC522::MIFARE_Key key;
+  for (byte i=0; i<6; i++) key.keyByte[i] = 0xFF;
+
+  if(!rfid.PICC_IsNewCardPresent()){return;}
+  if(!rfid.PICC_ReadCardSerial()){return;}
+  
+  milisegundo = 0;
+  String codigo = read_block(5,key);
+  Serial.println(codigo);
+  if(codigo!="ERROR" && codigo!=""){
+    make_request("codigo",codigo);
+  } else{    
+    emit_led(4);
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("ERROR! SIN DATOS");
+  }
+  
+  delay(50);
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+void make_request(String clave, String& id){
+  String postData = clave + "=" + id +"&rastreo=RFID_GRAU";
+  if (client.connect(server,3000)){
+    client.println("POST /api/cimapersonal/asistencia/buscar/alumno HTTP/1.1");
+    client.println("Host: 192.168.70.13");
+    client.println("Cache-Control: no-cache");
+    client.println("Content-Type: application/x-www-form-urlencoded");
+    client.print("Content-Length: ");
+    client.println(postData.length());
+    client.println();
+    client.println(postData);
+
+    if (client.println() == 0) {
+      return;
+    }
+
+    //Verificar Estado HTTP
+    char status[32] = {0};
+    client.readBytesUntil('\r', status, sizeof(status));
+    if (strcmp(status, "HTTP/1.1 200 OK") != 0) {
+      emit_led(2);
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("ERROR!");
+      lcd.setCursor(0, 1);
+      lcd.print("INTENTE OTRA VEZ");
+      return;
+    }
+
+    //Omitir encabezados HTTP
+    char endOfHeaders[] = "\r\n\r\n";
+    if (!client.find(endOfHeaders)) {
+      return;
+    }
+    String response = "";
+    
+    while (client.available())
+    {
+      char c = client.read();
+      response = response + c;
+      // Serial.print(c);
+    }
+
+    emit_led(1);
+
+    conectado = true;
+    if (clave == "codigos") {
+      SD.remove("DATA.TXT");
+      codigos="";      
+    }else{
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(getValue(response, '-', 0));
+      lcd.setCursor(0, 1);
+      lcd.print(getValue(response, '-', 1));
+    }
+
+    client.stop();
+  }else{
+      conectado=false;
+      if(clave=="codigo"){
+        save_to_SD(id);
+        lcd.clear();
+        emit_led(3);
+        lcd.setCursor(0, 0);
+        lcd.clear();
+        lcd.print("INGRESO SIN RED");
+      }     
+  }
+}
+
+String read_block(byte block, MFRC522::MIFARE_Key &key){
+  byte len = 18;
+  byte myBuffer[18];
+  String response = "";
+  MFRC522::StatusCode status;
+
+  status = rfid.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(rfid.uid));
+  if (status != MFRC522::STATUS_OK){response="ERROR";}
+
+  status = rfid.MIFARE_Read(block, myBuffer, &len);
+  if (status != MFRC522::STATUS_OK){response="ERROR";}
+  response = (char *)myBuffer;
+  if(response==""){response = "ERROR";}
+  response = response.substring(0, 8);
+  response.trim();
+  
+  return response;
+}
+ 
+void emit_led(uint8_t state){
+  if(state==1){           //solicitud satisfactoria
+    digitalWrite(BUZZER,HIGH);
+    analogWrite(RED_LED, 255);
+    analogWrite(GREEN_LED, 0);
+    analogWrite(BLUE_LED, 255);
+    delay(100);
+  }else if(state==2){     //hay un error al hacer solicitud
+    analogWrite(RED_LED, 0);
+    analogWrite(GREEN_LED, 255);
+    analogWrite(BLUE_LED, 255);
+    digitalWrite(7, HIGH);
+    delay(50);
+    digitalWrite(7, LOW);
+    delay(50);
+    digitalWrite(7, HIGH);
+    delay(50);
+    digitalWrite(7, LOW);
+    delay(50);
+    digitalWrite(7, HIGH);
+    delay(50);
+  }else if(state==3){     //no hay red
+    digitalWrite(BUZZER, HIGH);
+    analogWrite(RED_LED, 255);
+    analogWrite(GREEN_LED, 255);
+    analogWrite(BLUE_LED, 0);
+    delay(100);
+  }else if(state==4){     //no hay nada en la tarjeta.
+    digitalWrite(7, HIGH);
+    delay(50);
+    digitalWrite(7, LOW);
+    delay(50);
+    digitalWrite(7, HIGH);
+    delay(50);
+  }
+  low_leds();
+}
+
+String getValue(String data, char separator, uint8_t index){
+  int found = 0;
+  int strIndex[] = {0, -1};
+  int maxIndex = data.length() - 1;
+
+  for (int i = 0; i <= maxIndex && found <= index; i++)
+  {
+    if (data.charAt(i) == separator || i == maxIndex)
+    {
+      found++;
+      strIndex[0] = strIndex[1] + 1;
+      strIndex[1] = (i == maxIndex) ? i + 1 : i;
+    }
+  }
+
+  return found > index ? data.substring(strIndex[0], strIndex[1]) : "";
+}
+
+void save_to_SD(String &id){
+  myFile = SD.open("DATA.TXT", FILE_WRITE); //abrir para escritura o crear si no existe archivo data.txt
+  if (myFile)
+  { //Si se pudo abrir el archivo de datos, escribe en el nuevos datos.
+    myFile.print(id);
+    myFile.print(",");
+    myFile.close(); // Se cierra el archivo data.txt
+    codigos = codigos + id + ",";
+  }
+}
+
+void clear_to_SD(){
+  myFile = SD.open("DATA.TXT", FILE_READ); // re-abrir archivo para leer la informacion que hay en el
+  if (myFile)
+  {
+    String rpta = "";
+    //rpta = (char *)myFile.read();
+    while (myFile.available())
+    { // Lee todo el contenido del archivo hasta encontrar EOF
+      // char caux = myFile.read();
+      //rpta = rpta + (char)myFile.read();
+      //Serial.write(myFile.read());
+      rpta += (char)myFile.read();
+    }
+    myFile.close(); // Cierra El archivo
+    codigos = rpta;
+    Serial.println(rpta);
+
+  }
+  else
+  {
+    Serial.println(F("fallo al iniciar"));
+  }
+}
+void reloj()
+{
+
+ lcd.setCursor(12,3);
+ lcd.print(rtc.getTimeStr());
+  
+  // Send date
+  lcd.setCursor(0,3);
+ lcd.print(rtc.getDateStr());
+  //Serial.print(" -- ");
+
+  
+  delay (100);
+}
